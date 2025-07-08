@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import cv2
-import numpy as np
-import copy
-import matplotlib.pyplot as plt
+# Original source https://github.com/naotokimura/EdgeTangentFlow
 
-M_PI = 3.14159265358979323846
+import os
+import numpy as np
+import multiprocessing as mp
+from PIL import Image, ImageOps
+from scipy import ndimage
+
+
 KERNEL = 5
 COLOUR_OR_GRAY = 0
-input_img = "{./data/input.jpg}"
-SIZE = (1000, 1000, 3)
+input_img = "test_images/Lenna.png"
+SIZE = (512, 512, 3)
+CPU_COUNT = mp.cpu_count()
 
 flowField = np.zeros(SIZE, dtype = np.float32)
-refinedETF = np.zeros(SIZE, dtype = np.float32)
 gradientMag = np.zeros(SIZE, dtype = np.float32)
 
 ####################
@@ -24,85 +27,129 @@ gradientMag = np.zeros(SIZE, dtype = np.float32)
  #cv2.Sobel(src, ddepth, dx, dy[, dst[, ksize[, scale[, delta[, borderType]]]]])：微分
  #cv2.magnitude(x, y[, magnitude])：2次元ベクトルの大きさ
 
+
+
 def initial_ETF(input_img, size):
     global flowField
-    global refinedETF
     global gradientMag
-    
-    src = cv2.imread(input_img, COLOUR_OR_GRAY)
-    src_n = np.zeros(size, dtype = np.float32)
-    src_n = cv2.normalize(src.astype('float32'), None, 0.0, 1.0, cv2.NORM_MINMAX)
+
+    src = np.array(ImageOps.exif_transpose(Image.open(input_img)).convert("L"))
+    src_n = np.array(src, dtype=np.float32) / 255
 
     #Generate grad_x and grad_y
-    grad_x = []
-    grad_y = []
-    grad_x = cv2.Sobel(src_n, cv2.CV_32FC1, 1, 0, ksize=5)
-    grad_y = cv2.Sobel(src_n, cv2.CV_32FC1, 0, 1, ksize=5)
-    
-    #Compute gradient
-    gradientMag = cv2.sqrt(grad_x**2.0 + grad_y**2.0) 
-    gradientMag = cv2.normalize(gradientMag.astype('float32'), None, 0.0, 1.0, cv2.NORM_MINMAX)
-    h,w = src.shape[0], src.shape[1]
-    for i in range(h):
-        for j in range(w):
-            u = grad_x[i][j]
-            v = grad_y[i][j]
-            n = np.array([v, u, 0.0])
-            cv2.normalize(np.array([v, u, 0.0]).astype('float32'), n)
-            flowField[i][j] = n
-    rotateFlow(flowField, flowField, 90.0)
+    grad_x = np.array(ndimage.sobel(src_n, axis=1))
+    grad_y = np.array(ndimage.sobel(src_n, axis=0))
 
-def rotateFlow(src, dst, theta):
-    theta = theta / 180.0 * M_PI;
-    h,w = src.shape[0], src.shape[1]
-    for i in range(h):
-        for j in range(w):
-            v = src[i][j]
-            rx = v[0] * np.cos(theta) - v[1] * np.sin(theta)
-            ry = v[1] * np.cos(theta) + v[0] * np.sin(theta)
-            flowField[i][j] = [rx, ry, 0.0]
+    #Compute gradient
+    gradientMag = np.sqrt(grad_x**2.0 + grad_y**2.0)
+    gradientMag = gradientMag / np.max(gradientMag)
+
+    flowField = np.stack((grad_x, grad_y), axis=-1)
+    norm = np.linalg.norm(flowField, axis=2, keepdims=True)
+    norm[norm == 0] = 1
+    flowField = flowField / norm
+
+    rotateFlow(flowField, 90.0)
+
+
+
+def rotateFlow(src, theta):
+    global flowField
+
+    theta = theta / 180.0 * np.pi
+
+    rx = src[:, :, 0] * np.cos(theta) - src[:, :, 1] * np.sin(theta)
+    ry = src[:, :, 1] * np.cos(theta) + src[:, :, 0] * np.sin(theta)
+
+    flowField = np.stack((rx, ry, np.zeros_like(rx)), axis=-1)
+
+
 
 def refine_ETF(kernel):
     global flowField
-    global refinedETF
-    global gradientMag
-    h_f,w_f = flowField.shape[0], flowField.shape[1]
+
+    h_f, w_f = flowField.shape[:2]
+    args = []
     for r in range(h_f):
         for c in range(w_f):
-            computeNewVector(c, r, kernel)
-    flowField = copy.deepcopy(refinedETF)
-    
+            args.append([c, r, kernel])
+            #computeNewVector(c, r, kernel)
+
+    with mp.Pool() as pool:
+        results = pool.starmap(computeNewVector, args)
+
+    #print(results)
+    for y, x, vec in results:
+        #print(y, x, vec)
+        flowField[int(y), int(x), :] = vec
+
+
+
+def process_pixel(x, y, kernel):
+    result_vec = computeNewVector(x, y, kernel)
+    return (y, x, result_vec)
+
+
+
 #Paper's Eq(1)
 def computeNewVector(x, y, kernel):
-    global flowField
-    global refinedETF
-    global gradientMag
-    t_cur_x = flowField[y][x]
-    t_new = (0, 0, 0)
-    h_r,w_r = refinedETF.shape[0], refinedETF.shape[1]
-    for r in range(y - kernel, y + kernel + 1):
-        for c in range(x - kernel, x + kernel + 1):
-            if (r < 0 or r >= h_r or c < 0 or c >= w_r): 
-                continue
-            t_cur_y = flowField[r][c]
-            a = np.array([x, y])
-            b = np.array([c, r])
-            phi = computePhi(t_cur_x, t_cur_y);
-            w_s = computeWs(a, b, kernel);
-            w_m = computeWm(gradientMag[y][x], gradientMag[r][c])
-            w_d = computeWd(t_cur_x, t_cur_y)
-            t_new += phi * t_cur_y * w_s * w_m * w_d
-    n = t_new
-    cv2.normalize(t_new, n)
-    refinedETF[y][x] = n
+    global flowField, gradientMag
 
+    h, w = flowField.shape[:2]
+
+    y_min = max(0, y - kernel)
+    y_max = min(h, y + kernel + 1)
+    x_min = max(0, x - kernel)
+    x_max = min(w, x + kernel + 1)
+
+    # Central vector
+    t_cur_x = flowField[y, x]
+    gradmag_x = gradientMag[y, x]
+    pos_xy = np.array([x, y])
+
+    # Getting neighborhoods
+    patch_flow = flowField[y_min:y_max, x_min:x_max]  # (Hk, Wk, 3)
+    patch_mag = gradientMag[y_min:y_max, x_min:x_max] # (Hk, Wk)
+
+    # Neighborhood coords
+    yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
+    patch_pos = np.stack((xx, yy), axis=-1)  # (Hk, Wk, 2)
+
+    phi = np.sign(np.sum(patch_flow * t_cur_x, axis=-1))  # (Hk, Wk) # Eq(5)
+    dist = np.linalg.norm(patch_pos - pos_xy, axis=-1)
+    ws = (dist < kernel).astype(np.float32) # Eq(2)
+    wm = (1 + np.tanh(patch_mag - gradmag_x)) / 2 # Eq(3)
+    wd = np.abs(np.sum(patch_flow * t_cur_x, axis=-1)) # Eq(4)
+
+    weight = phi * ws * wm * wd  # (Hk, Wk)
+
+    # Applying to vectors
+    weighted = patch_flow * weight[..., np.newaxis]  # (Hk, Wk, 3)
+
+    # Total sum
+    t_new = np.sum(weighted, axis=(0, 1))
+
+    norm = np.linalg.norm(t_new)
+    if norm > 0:
+        t_new /= norm
+    else:
+        t_new = np.zeros_like(t_new)
+
+    #refinedETF[y, x] = t_new
+    return y, x, t_new
+
+
+
+# TODO these functions are not needed anymore
 #Paper's Eq(5)
 def computePhi(x, y):
-    if np.dot(x,y) > 0:
+    if np.dot(x, y) > 0:
         return 1
     else:
         return -1
     
+
+
 #Paper's Eq(2)
 def computeWs(x, y, r):
     if np.linalg.norm(x-y) < r:
@@ -110,33 +157,42 @@ def computeWs(x, y, r):
     else:
         return 0
 
+
+
 #Paper's Eq(3)
+# TODO implement eta
+# wm = (1 + np.tanh(eta(gradmag_y - gradmag_x))) / 2
 def computeWm(gradmag_x, gradmag_y):
     wm = (1 + np.tanh(gradmag_y - gradmag_x)) / 2
     return wm
+
+
 
 #Paper's Eq(4)
 def computeWd(x, y):
     return abs(x.dot(y))
 
-#plot arrowline and save image.
-def draw_arrowline(count,KERNEL):
+
+
+# save image
+def save_ETF(count, kernel):
     global flowField
-    dis = cv2.imread(input_img, COLOUR_OR_GRAY)
-    resolution = 10;
-    h,w = dis.shape[0], dis.shape[1]
-    for i in range(0,h,resolution):
-        for j in range(0,w,resolution):
-            v = flowField[i][j]
-            p = (j, i)
-            p2 = (int(j+v[1]*5), int(i+v[0]*5))
-            dis = cv2.arrowedLine(dis, p, p2, (255, 0, 0), 1, 8, 0, 0.3)
-    cv2.imwrite('etf_kernel' + str(KERNEL) + '_' + str(count) +'.png',dis)
-    np.save('np_etf_kernel' + str(KERNEL) + '_' + str(count) +'.npy', flowField)
+    global img_name
+
+    img_name = os.path.splitext(os.path.basename(input_img))[0]
+    directory = os.path.join("frames", img_name)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    np.save(directory + f"/etf_kernel_iter_{kernel}_{count}.npy", flowField)
+
+
 
 if __name__ == '__main__':
+    print("Making initial ETF...", flush=True)
     initial_ETF(input_img, SIZE)
+    print("Starting refinement...", flush=True)
     for i in range(10):
-        refine_ETF(KERNEL)
-        draw_arrowline(i,KERNEL)
-
+        print(f"Iteration {i:2d}")
+        refine_ETF_mp(KERNEL)
+        save_ETF(i, KERNEL)
