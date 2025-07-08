@@ -18,7 +18,6 @@ CPU_COUNT = mp.cpu_count()
 
 flowField = np.zeros(SIZE, dtype = np.float32)
 gradientMag = np.zeros(SIZE, dtype = np.float32)
-phiPreCalc = np.zeros(SIZE, dtype = np.float32)
 
 ####################
 # Generate ETF 
@@ -142,6 +141,7 @@ def computeNewVector(x, y, kernel):
 
 
 
+# TODO these functions are not needed anymore
 #Paper's Eq(5)
 def computePhi(x, y):
     if np.dot(x, y) > 0:
