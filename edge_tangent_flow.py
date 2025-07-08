@@ -35,7 +35,6 @@ def initial_ETF(input_img, size):
 
     src = np.array(ImageOps.exif_transpose(Image.open(input_img)).convert("L"))
     src_n = np.array(src, dtype=np.float32) / 255
-    print(src.shape)
 
     #Generate grad_x and grad_y
     grad_x = np.array(ndimage.sobel(src_n, axis=1))
